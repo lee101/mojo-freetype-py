@@ -85,17 +85,25 @@ is the best of five complete glyph batches after warming both renderers.
 
 | case | Mojo | FreeType | ratio |
 | --- | ---: | ---: | ---: |
-| grayscale 16 px, 200 glyphs | 16.41 ms | 2.48 ms | 0.151x (slower) |
-| grayscale 48 px, 100 glyphs | 8.82 ms | 1.03 ms | 0.116x (slower) |
-| grayscale 128 px, 40 glyphs | 10.51 ms | 1.21 ms | 0.115x (slower) |
-| mono 48 px, 100 glyphs | 16.33 ms | 1.96 ms | 0.120x (slower) |
+| grayscale 16 px, 200 glyphs | 7.10 ms | 1.78 ms | 0.251x (slower) |
+| grayscale 48 px, 100 glyphs | 5.26 ms | 1.26 ms | 0.239x (slower) |
+| grayscale 128 px, 40 glyphs | 4.21 ms | 0.76 ms | 0.180x (slower) |
+| mono 48 px, 100 glyphs | 5.97 ms | 1.46 ms | 0.245x (slower) |
 
-FreeType remains faster. Prepared edges are cached per face and invalidated
-when face state changes. The scan converter builds a SIMD-filtered active-edge
-list once per row, vectorizes coverage and mono packing with scalar tails, and
-can use independent row workers for sufficiently large glyphs. `pixi run
-bench` serializes benchmark runs with a machine-wide lock. There is no GPU
-path.
+FreeType remains faster. Prepared edges, bounds, fill metadata, and active-edge
+row maps are cached per face and invalidated when face state changes. Reusable
+scratch arrays retain their addresses across glyphs. The scan converter uses
+12 vertical samples by default, SIMD-filters uncached edges, and vectorizes
+coverage quantization and mono packing with scalar tails. `pixi run bench`
+serializes benchmark runs with a machine-wide lock.
+
+There is no parallel or GPU path. The pinned standalone Mojo standard library
+does not export `parallelize`; `parallel_threshold` remains accepted for API
+compatibility and both sides of the threshold produce the serial result. GPU
+offload is not justified: active-edge filtering and intersection evaluation do
+fewer than two arithmetic operations per byte loaded, then perform branchy,
+irregular insertion sorting. Transfer and launch overhead would dominate, so
+no MAX dependency or losing GPU path is included.
 
 ## How it works
 
@@ -103,18 +111,19 @@ FreeType loads, scales, hints, and decomposes the selected glyph outline.
 Quadratic and cubic Bézier curves are adaptively flattened into a contiguous
 row-major NumPy array of line-segment endpoints. Non-horizontal edges are
 prepared into a structure-of-arrays layout with bounds, inverse slopes, and
-winding directions, then cached by `Face`.
+winding directions. `Face` also caches a compact row-to-edge map for glyphs
+large enough to benefit from it.
 
 Python makes one synchronous `ctypes` call into the Mojo shared library.
 Python validates and owns every input, output, and scratch allocation for the
 duration of that call, so NumPy storage crosses the FFI boundary without a
-copy.
+copy. Per-face scratch buffers grow geometrically and are reused.
 
-For each output row, Mojo filters the prepared edges, intersects and sorts the
-active candidates for each sample, applies the outline's winding rule, and
-accumulates horizontal pixel coverage. Rows are stored top-to-bottom as
-contiguous gray values. Mono mode thresholds that coverage and packs bits in
-FreeType-compatible order and pitch.
+For each output row, Mojo uses cached candidates when available or filters the
+prepared edges with SIMD, intersects and sorts them for each sample, applies
+the outline's winding rule, and accumulates horizontal pixel coverage. Rows
+are stored top-to-bottom as contiguous gray values. Mono mode thresholds that
+coverage and packs bits in FreeType-compatible order and pitch.
 
 ## License
 

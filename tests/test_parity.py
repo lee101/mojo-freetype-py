@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import mojofreetype as mft
-from mojofreetype._lib import lib
+from mojofreetype._lib import addr, lib
 
 
 def _font() -> str:
@@ -218,6 +218,20 @@ def test_simd_tail_render_parity():
     assert np.quantile(difference, 0.99) <= 24
 
 
+@pytest.mark.parametrize("width", [16, 13])
+def test_simd_mono_pack_full_vectors_and_tail(width):
+    gray = np.arange(3 * width, dtype=np.uint8).reshape(3, width) * 17
+    pitch = ((width + 15) // 16) * 2
+    packed = np.empty((3, pitch), dtype=np.uint8)
+    lib().mft_pack_mono(
+        addr(gray), addr(packed), width, 3, width, pitch
+    )
+    expected = np.zeros_like(packed)
+    bits = np.packbits(gray >= 128, axis=1, bitorder="big")
+    expected[:, : bits.shape[1]] = bits
+    assert np.array_equal(packed, expected)
+
+
 @pytest.mark.parametrize(
     ("config", "error"),
     [
@@ -309,6 +323,25 @@ def test_face_reuses_and_invalidates_prepared_segments(monkeypatch):
     face.set_pixel_sizes(0, 48)
     face.load_char("A")
     assert calls == 2
+
+
+def test_face_reuses_raster_scratch_allocations():
+    face = mft.Face(_font())
+    face.set_pixel_sizes(0, 128)
+    face.load_char("@")
+    scratch_ids = (
+        id(face._scratch.intersections),
+        id(face._scratch.directions),
+        id(face._scratch.active_edges),
+        id(face._scratch.coverage),
+    )
+    face.load_char("@")
+    assert scratch_ids == (
+        id(face._scratch.intersections),
+        id(face._scratch.directions),
+        id(face._scratch.active_edges),
+        id(face._scratch.coverage),
+    )
 
 
 @pytest.mark.parametrize("char", ["S", "g", "@", "8"])

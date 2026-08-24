@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import math
+
 import freetype as _ft
 
+from ._lib import _addr_unchecked
 from .raster import (
     Bitmap,
     DEFAULT_CONFIG,
     RasterConfig,
+    _Scratch,
+    _prepare_row_edges,
     _prepare_segments,
     flatten_outline,
     rasterize,
@@ -50,11 +55,32 @@ class GlyphSlot:
             else self._slot.bitmap_top
         )
 
-    def render(self, render_mode, *, _segments=None):
+    def render(
+        self,
+        render_mode,
+        *,
+        _segments=None,
+        _segments_addr=0,
+        _bounds=None,
+        _even_odd=None,
+        _scratch=None,
+        _row_offsets=None,
+        _row_edges=None,
+        _row_offsets_addr=0,
+        _row_edges_addr=0,
+    ):
         bitmap, left, top = rasterize(
             self._slot.outline,
             render_mode,
             _segments=_segments,
+            _segments_addr=_segments_addr,
+            _bounds=_bounds,
+            _even_odd=_even_odd,
+            _scratch=_scratch,
+            _row_offsets=_row_offsets,
+            _row_edges=_row_edges,
+            _row_offsets_addr=_row_offsets_addr,
+            _row_edges_addr=_row_edges_addr,
         )
         self._bitmap = bitmap
         self._bitmap_left = left
@@ -72,6 +98,7 @@ class Face:
         self._face = _ft.Face(path_or_stream, index)
         self._glyph = GlyphSlot(self._face.glyph)
         self._segment_cache = {}
+        self._scratch = _Scratch()
         self._state_generation = 0
 
     def __getattr__(self, name):
@@ -151,13 +178,76 @@ class Face:
                 int(glyph_index),
                 int(flags) & ~_ft.FT_LOAD_RENDER,
             )
-            segments = self._segment_cache.get(cache_key)
-            if segments is None:
+            prepared = self._segment_cache.get(cache_key)
+            if prepared is None:
+                outline = self._glyph._slot.outline
                 segments = _prepare_segments(
-                    flatten_outline(self._glyph._slot.outline)
+                    flatten_outline(outline)
                 )
-                self._segment_cache[cache_key] = segments
-            self._glyph.render(mode, _segments=segments)
+                segments_addr = _addr_unchecked(segments)
+                bounds = None
+                if outline.n_points:
+                    bbox = outline.get_bbox()
+                    bounds = (
+                        math.floor(bbox.xMin / 64.0),
+                        math.ceil(bbox.xMax / 64.0),
+                        math.floor(bbox.yMin / 64.0),
+                        math.ceil(bbox.yMax / 64.0),
+                    )
+                even_odd = int(
+                    bool(outline.flags & _ft.FT_OUTLINE_EVEN_ODD_FILL)
+                )
+                row_offsets = None
+                row_edges = None
+                if (
+                    bounds is not None
+                    and segments.shape[1]
+                    and (bounds[3] - bounds[2]) * segments.shape[1] >= 512
+                ):
+                    row_offsets, row_edges = _prepare_row_edges(
+                        segments, bounds[3], bounds[3] - bounds[2]
+                    )
+                row_offsets_addr = (
+                    0
+                    if row_offsets is None
+                    else _addr_unchecked(row_offsets)
+                )
+                row_edges_addr = (
+                    0 if row_edges is None else _addr_unchecked(row_edges)
+                )
+                prepared = (
+                    segments,
+                    segments_addr,
+                    bounds,
+                    even_odd,
+                    row_offsets,
+                    row_edges,
+                    row_offsets_addr,
+                    row_edges_addr,
+                )
+                self._segment_cache[cache_key] = prepared
+            (
+                segments,
+                segments_addr,
+                bounds,
+                even_odd,
+                row_offsets,
+                row_edges,
+                row_offsets_addr,
+                row_edges_addr,
+            ) = prepared
+            self._glyph.render(
+                mode,
+                _segments=segments,
+                _segments_addr=segments_addr,
+                _bounds=bounds,
+                _even_odd=even_odd,
+                _scratch=self._scratch,
+                _row_offsets=row_offsets,
+                _row_edges=row_edges,
+                _row_offsets_addr=row_offsets_addr,
+                _row_edges_addr=row_edges_addr,
+            )
 
     def load_char(self, char, flags=_ft.FT_LOAD_RENDER):
         load_flags = int(flags)

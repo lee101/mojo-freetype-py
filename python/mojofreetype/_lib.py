@@ -18,7 +18,7 @@ LIB = os.environ.get("MOJOFREETYPE_LIB") or os.path.join(
 I = ctypes.c_int64
 
 _SIGNATURES = {
-    "mft_raster_gray": ([I] * 15, None),
+    "mft_raster_gray": ([I] * 17, None),
     "mft_pack_mono": ([I] * 6, None),
     "mft_simd_width_float64": ([], I),
 }
@@ -83,4 +83,12 @@ def addr(array: np.ndarray) -> int:
         raise ValueError("FFI buffers must be C-contiguous")
     if array.size == 0 or array.ctypes.data == 0:
         raise ValueError("FFI buffers must be non-empty and non-null")
+    return int(array.ctypes.data)
+
+
+def _addr_unchecked(array: np.ndarray) -> int:
+    if array.size == 0:
+        return 0
+    if array.flags.writeable:
+        return ctypes.addressof(ctypes.c_char.from_buffer(array))
     return int(array.ctypes.data)

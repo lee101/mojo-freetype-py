@@ -1,7 +1,7 @@
 """Anti-aliased scan conversion for flattened glyph outlines."""
 
 from std.math import floor
-from std.sys.info import simd_width_of
+from std.sys.info import simd_width_of as simdwidthof
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int32, AnyOrigin[mut=True]]
@@ -32,7 +32,7 @@ def add_span(
     if first == last:
         return
 
-    comptime W = simd_width_of[DType.float64]()
+    comptime W = simdwidthof[DType.float64]()
     var col = first + 1
     while col + W <= last:
         var values = coverage.load[width=W](col)
@@ -54,6 +54,9 @@ def raster_gray_row(
     intersections: FPtr,
     directions: IPtr,
     active_edges: IPtr,
+    cached_offsets: IPtr,
+    cached_edges: IPtr,
+    use_cached_edges: Bool,
     coverage: FPtr,
     bitmap: BPtr,
     width: Int,
@@ -71,7 +74,7 @@ def raster_gray_row(
     var row_active_edges = active_edges + scratch_row * edge_count
     var row_coverage = coverage + scratch_row * width
 
-    comptime W = simd_width_of[DType.float64]()
+    comptime W = simdwidthof[DType.float64]()
     var col = 0
     while col + W <= width:
         row_coverage.store(col, SIMD[DType.float64, W](0.0))
@@ -84,25 +87,30 @@ def raster_gray_row(
     var row_bottom = row_top - 1.0
     var candidate_count = 0
     var edge = 0
-    while edge + W <= edge_count:
-        var y_min = segments.load[width=W](edge_count + edge)
-        var y_max = segments.load[width=W](2 * edge_count + edge)
-        var top_values = SIMD[DType.float64, W](row_top)
-        var bottom_values = SIMD[DType.float64, W](row_bottom)
-        var active = y_min.lt(top_values) & y_max.gt(bottom_values)
-        comptime for lane in range(Int(W)):
-            if active[lane]:
-                row_active_edges[candidate_count] = Int32(edge + lane)
+    if use_cached_edges:
+        var active_start = Int(cached_offsets[row])
+        candidate_count = Int(cached_offsets[row + 1]) - active_start
+        row_active_edges = cached_edges + active_start
+    else:
+        while edge + W <= edge_count:
+            var y_min = segments.load[width=W](edge_count + edge)
+            var y_max = segments.load[width=W](2 * edge_count + edge)
+            var top_values = SIMD[DType.float64, W](row_top)
+            var bottom_values = SIMD[DType.float64, W](row_bottom)
+            var active = y_min.lt(top_values) & y_max.gt(bottom_values)
+            comptime for lane in range(Int(W)):
+                if active[lane]:
+                    row_active_edges[candidate_count] = Int32(edge + lane)
+                    candidate_count += 1
+            edge += W
+        while edge < edge_count:
+            if (
+                segments[edge_count + edge] < row_top
+                and segments[2 * edge_count + edge] > row_bottom
+            ):
+                row_active_edges[candidate_count] = Int32(edge)
                 candidate_count += 1
-        edge += W
-    while edge < edge_count:
-        if (
-            segments[edge_count + edge] < row_top
-            and segments[2 * edge_count + edge] > row_bottom
-        ):
-            row_active_edges[candidate_count] = Int32(edge)
-            candidate_count += 1
-        edge += 1
+            edge += 1
 
     var inverse_samples = 1.0 / Float64(samples)
     for sample in range(samples):
@@ -160,10 +168,10 @@ def raster_gray_row(
             values,
             SIMD[DType.float64, W](0.0),
         )
-        comptime for lane in range(W):
-            bitmap[row * pitch + col + lane] = UInt8(
-                Int(floor(values[lane] + 0.5))
-            )
+        bitmap.store(
+            row * pitch + col,
+            (values + 0.5).cast[DType.uint8](),
+        )
         col += W
     while col < width:
         var value = row_coverage[col] * scale
@@ -178,6 +186,9 @@ def raster_gray(
     intersections: FPtr,
     directions: IPtr,
     active_edges: IPtr,
+    cached_offsets: IPtr,
+    cached_edges: IPtr,
+    use_cached_edges: Bool,
     coverage: FPtr,
     bitmap: BPtr,
     width: Int,
@@ -192,9 +203,6 @@ def raster_gray(
     if width <= 0 or height <= 0 or samples <= 0:
         return
 
-    # CPU task scheduling moved from the Mojo standard library into MAX. Keep
-    # the ABI (including use_parallel) independent of MAX and render rows
-    # serially until Mojo provides a standalone replacement.
     _ = use_parallel
     for row in range(height):
         raster_gray_row(
@@ -203,6 +211,9 @@ def raster_gray(
             intersections,
             directions,
             active_edges,
+            cached_offsets,
+            cached_edges,
+            use_cached_edges,
             coverage,
             bitmap,
             width,
@@ -226,6 +237,8 @@ def pack_mono(
     mono_pitch: Int,
 ):
     comptime W = 8
+    var bit_weights = SIMD[DType.uint8, W](128, 64, 32, 16, 8, 4, 2, 1)
+    var zeros = SIMD[DType.uint8, W](0)
     for row in range(height):
         var row_gray = gray + row * gray_pitch
         var row_mono = mono + row * mono_pitch
@@ -234,11 +247,7 @@ def pack_mono(
         while col + W <= width:
             var values = row_gray.load[width=W](col)
             var set_bits = values.ge(SIMD[DType.uint8, W](128))
-            var packed = UInt8(0)
-            comptime for lane in range(Int(W)):
-                if set_bits[lane]:
-                    packed = packed | UInt8(1 << (7 - lane))
-            row_mono[byte] = packed
+            row_mono[byte] = set_bits.select(bit_weights, zeros).reduce_add()
             col += W
             byte += 1
         if col < width:
@@ -261,6 +270,8 @@ def mft_raster_gray(
     intersections_addr: Int,
     directions_addr: Int,
     active_edges_addr: Int,
+    cached_offsets_addr: Int,
+    cached_edges_addr: Int,
     coverage_addr: Int,
     bitmap_addr: Int,
     width: Int,
@@ -272,12 +283,23 @@ def mft_raster_gray(
     even_odd: Int,
     use_parallel: Int,
 ) abi("C"):
+    var active_edges = IPtr(unsafe_from_address=active_edges_addr)
+    var cached_offsets = active_edges
+    var cached_edges = active_edges
+    var use_cached_edges = False
+    if cached_offsets_addr != 0 and cached_edges_addr != 0:
+        cached_offsets = IPtr(unsafe_from_address=cached_offsets_addr)
+        cached_edges = IPtr(unsafe_from_address=cached_edges_addr)
+        use_cached_edges = True
     raster_gray(
         FPtr(unsafe_from_address=segments_addr),
         edge_count,
         FPtr(unsafe_from_address=intersections_addr),
         IPtr(unsafe_from_address=directions_addr),
-        IPtr(unsafe_from_address=active_edges_addr),
+        active_edges,
+        cached_offsets,
+        cached_edges,
+        use_cached_edges,
         FPtr(unsafe_from_address=coverage_addr),
         BPtr(unsafe_from_address=bitmap_addr),
         width,
@@ -312,4 +334,4 @@ def mft_pack_mono(
 
 @export("mft_simd_width_float64")
 def mft_simd_width_float64() abi("C") -> Int:
-    return simd_width_of[DType.float64]()
+    return simdwidthof[DType.float64]()

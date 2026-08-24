@@ -10,12 +10,12 @@ from typing import Callable
 import freetype as _ft
 import numpy as np
 
-from ._lib import addr, lib
+from ._lib import _addr_unchecked, addr, lib
 
 
 @dataclass(frozen=True)
 class RasterConfig:
-    samples: int = 16
+    samples: int = 12
     curve_tolerance: float = 1.0 / 8.0
     max_curve_depth: int = 12
     parallel_threshold: int = 10_000_000
@@ -23,6 +23,44 @@ class RasterConfig:
 
 DEFAULT_CONFIG = RasterConfig()
 _INT64_MAX = (1 << 63) - 1
+
+
+class _Scratch:
+    def __init__(self) -> None:
+        self.intersections = np.empty(0, dtype=np.float64)
+        self.directions = np.empty(0, dtype=np.int32)
+        self.active_edges = np.empty(0, dtype=np.int32)
+        self.coverage = np.empty(0, dtype=np.float64)
+        self.intersections_addr = 0
+        self.directions_addr = 0
+        self.active_edges_addr = 0
+        self.coverage_addr = 0
+        self.edge_capacity = 0
+        self.coverage_capacity = 0
+
+    def reserve(self, rows: int, edge_count: int, width: int) -> None:
+        edge_size = rows * max(1, edge_count)
+        if edge_size > self.edge_capacity:
+            self.edge_capacity = max(edge_size, self.edge_capacity * 2)
+            self.intersections = np.empty(
+                self.edge_capacity, dtype=np.float64
+            )
+            self.directions = np.empty(self.edge_capacity, dtype=np.int32)
+            self.active_edges = np.empty(
+                self.edge_capacity, dtype=np.int32
+            )
+            self.intersections_addr = _addr_unchecked(self.intersections)
+            self.directions_addr = _addr_unchecked(self.directions)
+            self.active_edges_addr = _addr_unchecked(self.active_edges)
+        coverage_size = rows * width
+        if coverage_size > self.coverage_capacity:
+            self.coverage_capacity = max(
+                coverage_size, self.coverage_capacity * 2
+            )
+            self.coverage = np.empty(
+                self.coverage_capacity, dtype=np.float64
+            )
+            self.coverage_addr = _addr_unchecked(self.coverage)
 
 
 def _validate_config(config: RasterConfig) -> None:
@@ -45,7 +83,14 @@ class Bitmap:
     """The covered subset of :class:`freetype.Bitmap`."""
 
     def __init__(self, array: np.ndarray, pixel_mode: int = _ft.FT_PIXEL_MODE_GRAY):
-        self._array = np.ascontiguousarray(array, dtype=np.uint8)
+        if (
+            isinstance(array, np.ndarray)
+            and array.dtype == np.uint8
+            and array.flags.c_contiguous
+        ):
+            self._array = array
+        else:
+            self._array = np.ascontiguousarray(array, dtype=np.uint8)
         self._pixel_mode = int(pixel_mode)
 
     @property
@@ -162,7 +207,8 @@ def flatten_outline(
     config: RasterConfig = DEFAULT_CONFIG,
 ) -> np.ndarray:
     """Convert a freetype-py ``Outline`` into ``(x0, y0, x1, y1)`` edges."""
-    _validate_config(config)
+    if config is not DEFAULT_CONFIG:
+        _validate_config(config)
     edges: list[tuple[float, float, float, float]] = []
     start: tuple[float, float] | None = None
     current: tuple[float, float] | None = None
@@ -247,6 +293,29 @@ def _prepare_segments(segments: np.ndarray) -> np.ndarray:
     return prepared
 
 
+def _prepare_row_edges(
+    segments: np.ndarray, top: int, height: int
+) -> tuple[np.ndarray, np.ndarray]:
+    offsets = np.empty(height + 1, dtype=np.int32)
+    offsets[0] = 0
+    rows: list[np.ndarray] = []
+    total = 0
+    for row in range(height):
+        row_top = top - row
+        active = np.flatnonzero(
+            (segments[1] < row_top) & (segments[2] > row_top - 1)
+        ).astype(np.int32, copy=False)
+        rows.append(active)
+        total += active.size
+        offsets[row + 1] = total
+    edges = (
+        np.concatenate(rows)
+        if total
+        else np.empty(0, dtype=np.int32)
+    )
+    return offsets, edges
+
+
 def rasterize(
     outline,
     render_mode: int = _ft.FT_RENDER_MODE_NORMAL,
@@ -254,9 +323,18 @@ def rasterize(
     config: RasterConfig = DEFAULT_CONFIG,
     *,
     _segments: np.ndarray | None = None,
+    _segments_addr: int = 0,
+    _bounds: tuple[int, int, int, int] | None = None,
+    _even_odd: int | None = None,
+    _scratch: _Scratch | None = None,
+    _row_offsets: np.ndarray | None = None,
+    _row_edges: np.ndarray | None = None,
+    _row_offsets_addr: int = 0,
+    _row_edges_addr: int = 0,
 ) -> tuple[Bitmap, int, int]:
     """Rasterize an upstream ``Outline`` and return ``(bitmap, left, top)``."""
-    _validate_config(config)
+    if config is not DEFAULT_CONFIG:
+        _validate_config(config)
     if render_mode not in (
         _ft.FT_RENDER_MODE_NORMAL,
         _ft.FT_RENDER_MODE_LIGHT,
@@ -265,7 +343,7 @@ def rasterize(
         raise NotImplementedError(
             "only FT_RENDER_MODE_NORMAL, LIGHT, and MONO are covered"
         )
-    if outline.n_points == 0:
+    if _bounds is None and outline.n_points == 0:
         empty = np.empty((0, 0), dtype=np.uint8)
         bitmap = (
             Bitmap._mono(empty, 0)
@@ -280,11 +358,14 @@ def rasterize(
     else:
         translation = (float(origin[0]), float(origin[1]))
 
-    bbox = outline.get_bbox()
-    left = math.floor(bbox.xMin / 64.0 + translation[0])
-    right = math.ceil(bbox.xMax / 64.0 + translation[0])
-    bottom = math.floor(bbox.yMin / 64.0 + translation[1])
-    top = math.ceil(bbox.yMax / 64.0 + translation[1])
+    if _bounds is None:
+        bbox = outline.get_bbox()
+        left = math.floor(bbox.xMin / 64.0 + translation[0])
+        right = math.ceil(bbox.xMax / 64.0 + translation[0])
+        bottom = math.floor(bbox.yMin / 64.0 + translation[1])
+        top = math.ceil(bbox.yMax / 64.0 + translation[1])
+    else:
+        left, right, bottom, top = _bounds
     width, height = max(0, right - left), max(0, top - bottom)
     if width == 0 or height == 0:
         empty = np.empty((height, width), dtype=np.uint8)
@@ -330,26 +411,36 @@ def rasterize(
         and height * edge_count * config.samples
         >= config.parallel_threshold
     )
-    scratch_rows = height if parallel else 1
-    intersections = np.empty(
-        (scratch_rows, max(1, edge_count)), dtype=np.float64
+    scratch_rows = 1
+    scratch = _Scratch() if _scratch is None else _scratch
+    scratch.reserve(scratch_rows, edge_count, width)
+    intersections = scratch.intersections
+    directions = scratch.directions
+    active_edges = scratch.active_edges
+    coverage = scratch.coverage
+    even_odd = (
+        int(bool(outline.flags & _ft.FT_OUTLINE_EVEN_ODD_FILL))
+        if _even_odd is None
+        else _even_odd
     )
-    directions = np.empty(
-        (scratch_rows, max(1, edge_count)), dtype=np.int32
-    )
-    active_edges = np.empty(
-        (scratch_rows, max(1, edge_count)), dtype=np.int32
-    )
-    coverage = np.empty((scratch_rows, width), dtype=np.float64)
-    even_odd = int(bool(outline.flags & _ft.FT_OUTLINE_EVEN_ODD_FILL))
     lib().mft_raster_gray(
-        addr(segments),
+        _segments_addr or _addr_unchecked(segments),
         edge_count,
-        addr(intersections),
-        addr(directions),
-        addr(active_edges),
-        addr(coverage),
-        addr(gray),
+        scratch.intersections_addr,
+        scratch.directions_addr,
+        scratch.active_edges_addr,
+        (
+            0
+            if _row_offsets is None
+            else _row_offsets_addr or _addr_unchecked(_row_offsets)
+        ),
+        (
+            0
+            if _row_edges is None
+            else _row_edges_addr or _addr_unchecked(_row_edges)
+        ),
+        scratch.coverage_addr,
+        _addr_unchecked(gray),
         width,
         height,
         width,
@@ -365,6 +456,11 @@ def rasterize(
     mono_pitch = ((width + 15) // 16) * 2
     packed = np.empty((height, mono_pitch), dtype=np.uint8)
     lib().mft_pack_mono(
-        addr(gray), addr(packed), width, height, width, mono_pitch
+        _addr_unchecked(gray),
+        _addr_unchecked(packed),
+        width,
+        height,
+        width,
+        mono_pitch,
     )
     return Bitmap._mono(packed, width), left, top
