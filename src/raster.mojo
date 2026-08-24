@@ -1,7 +1,5 @@
 """Anti-aliased scan conversion for flattened glyph outlines."""
 
-from std.algorithm import parallelize
-from std.gpu.host import DeviceContext
 from std.math import floor
 from std.sys.info import simd_width_of
 
@@ -92,7 +90,7 @@ def raster_gray_row(
         var top_values = SIMD[DType.float64, W](row_top)
         var bottom_values = SIMD[DType.float64, W](row_bottom)
         var active = y_min.lt(top_values) & y_max.gt(bottom_values)
-        comptime for lane in range(W):
+        comptime for lane in range(Int(W)):
             if active[lane]:
                 row_active_edges[candidate_count] = Int32(edge + lane)
                 candidate_count += 1
@@ -194,73 +192,29 @@ def raster_gray(
     if width <= 0 or height <= 0 or samples <= 0:
         return
 
-    if use_parallel:
-        try:
-            var context = DeviceContext(api="cpu")
-            context.set_as_current()
-
-            @parameter
-            def render_row(row: Int):
-                raster_gray_row(
-                    segments,
-                    edge_count,
-                    intersections,
-                    directions,
-                    active_edges,
-                    coverage,
-                    bitmap,
-                    width,
-                    height,
-                    pitch,
-                    left,
-                    top,
-                    samples,
-                    even_odd,
-                    row,
-                    row,
-                )
-
-            parallelize[render_row](height)
-        except:
-            for row in range(height):
-                raster_gray_row(
-                    segments,
-                    edge_count,
-                    intersections,
-                    directions,
-                    active_edges,
-                    coverage,
-                    bitmap,
-                    width,
-                    height,
-                    pitch,
-                    left,
-                    top,
-                    samples,
-                    even_odd,
-                    row,
-                    row,
-                )
-    else:
-        for row in range(height):
-            raster_gray_row(
-                segments,
-                edge_count,
-                intersections,
-                directions,
-                active_edges,
-                coverage,
-                bitmap,
-                width,
-                height,
-                pitch,
-                left,
-                top,
-                samples,
-                even_odd,
-                row,
-                0,
-            )
+    # CPU task scheduling moved from the Mojo standard library into MAX. Keep
+    # the ABI (including use_parallel) independent of MAX and render rows
+    # serially until Mojo provides a standalone replacement.
+    _ = use_parallel
+    for row in range(height):
+        raster_gray_row(
+            segments,
+            edge_count,
+            intersections,
+            directions,
+            active_edges,
+            coverage,
+            bitmap,
+            width,
+            height,
+            pitch,
+            left,
+            top,
+            samples,
+            even_odd,
+            row,
+            0,
+        )
 
 
 def pack_mono(
@@ -281,7 +235,7 @@ def pack_mono(
             var values = row_gray.load[width=W](col)
             var set_bits = values.ge(SIMD[DType.uint8, W](128))
             var packed = UInt8(0)
-            comptime for lane in range(W):
+            comptime for lane in range(Int(W)):
                 if set_bits[lane]:
                     packed = packed | UInt8(1 << (7 - lane))
             row_mono[byte] = packed
