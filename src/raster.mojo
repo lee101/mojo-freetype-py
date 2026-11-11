@@ -35,7 +35,7 @@ def add_span(
     comptime W = simdwidthof[DType.float64]()
     var col = first + 1
     while col + W <= last:
-        var values = coverage.load[width=W](col)
+        var values = coverage.unsafe_load[width=W](col)
         coverage.store(col, values + 1.0)
         col += W
     while col < last:
@@ -93,8 +93,8 @@ def raster_gray_row(
         row_active_edges = cached_edges + active_start
     else:
         while edge + W <= edge_count:
-            var y_min = segments.load[width=W](edge_count + edge)
-            var y_max = segments.load[width=W](2 * edge_count + edge)
+            var y_min = segments.unsafe_load[width=W](edge_count + edge)
+            var y_max = segments.unsafe_load[width=W](2 * edge_count + edge)
             var top_values = SIMD[DType.float64, W](row_top)
             var bottom_values = SIMD[DType.float64, W](row_bottom)
             var active = y_min.lt(top_values) & y_max.gt(bottom_values)
@@ -159,7 +159,7 @@ def raster_gray_row(
     var scale = 255.0 * inverse_samples
     col = 0
     while col + W <= width:
-        var values = row_coverage.load[width=W](col) * scale
+        var values = row_coverage.unsafe_load[width=W](col) * scale
         values = min(
             values,
             SIMD[DType.float64, W](255.0),
@@ -245,7 +245,7 @@ def pack_mono(
         var col = 0
         var byte = 0
         while col + W <= width:
-            var values = row_gray.load[width=W](col)
+            var values = row_gray.unsafe_load[width=W](col)
             var set_bits = values.ge(SIMD[DType.uint8, W](128))
             row_mono[byte] = set_bits.select(bit_weights, zeros).reduce_add()
             col += W
